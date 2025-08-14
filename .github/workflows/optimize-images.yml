@@ -1,27 +1,83 @@
-name: Optimize Images
+name: Ensure JPEGs under 5MB
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
 
 jobs:
-  build:
+  shrink:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Optimize images
-        uses: calibreapp/image-actions@main
-        with:
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
-          compressOnly: true
-          quality: 80
-          ignorePaths: "node_modules/**"
+      # Ensure ImageMagick is present (usually preinstalled on ubuntu-latest, but this is safe)
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
 
-      - name: Commit optimized images
+      - name: Compress JPEGs to <5MB
+        shell: bash
+        run: |
+          set -euo pipefail
+          bytes_limit=$((5*1024*1024))
+
+          shopt -s globstar nullglob
+          changed=0
+
+          for f in **/*.jpg **/*.jpeg; do
+            # skip Git internals
+            [[ "$f" == .git/* ]] && continue
+
+            if [ -f "$f" ]; then
+              size=$(stat -c%s "$f")
+              if (( size > bytes_limit )); then
+                echo "Processing $f (current size: $((size/1024/1024)) MB)"
+                # First pass: strip metadata and recompress at 85
+                convert "$f" -strip -sampling-factor 4:2:0 -quality 85 "$f"
+
+                # If still too big, step down quality until under 5MB (min 40)
+                for q in 80 75 70 65 60 55 50 45 40; do
+                  size=$(stat -c%s "$f")
+                  (( size <= bytes_limit )) && break
+                  echo "  Still too large; trying quality=$q"
+                  convert "$f" -strip -sampling-factor 4:2:0 -quality "$q" "$f"
+                done
+
+                # If STILL too big (huge pixel dimensions), downscale gradually
+                size=$(stat -c%s "$f")
+                if (( size > bytes_limit )); then
+                  # query width; reduce in steps until under limit
+                  width=$(identify -format "%w" "$f")
+                  for target in 4000 3200 2800 2400 2000 1800 1600; do
+                    (( width <= target )) && continue
+                    echo "  Downscaling to width=$target"
+                    convert "$f" -strip -resize "${target}x" -sampling-factor 4:2:0 -quality 80 "$f"
+                    size=$(stat -c%s "$f")
+                    (( size <= bytes_limit )) && break
+                  done
+                fi
+
+                final=$(stat -c%s "$f")
+                if (( final > bytes_limit )); then
+                  echo "WARNING: $f still exceeds 5MB after compression (size=$((final/1024/1024)) MB)."
+                  echo "Consider larger downscaling or cropping."
+                else
+                  echo "Done: $f is now $((final/1024/1024)) MB"
+                fi
+                changed=1
+              fi
+            fi
+          done
+
+          if (( changed == 0 )); then
+            echo "No oversized JPEGs found or changes needed."
+          fi
+
+      - name: Commit changes (if any)
+        if: success()
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Optimize images via GitHub Actions"
+          commit_message: "Compress JPEGs to <5MB (CI)"
